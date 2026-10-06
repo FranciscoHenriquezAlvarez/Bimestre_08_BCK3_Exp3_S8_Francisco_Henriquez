@@ -1,0 +1,238 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: banco-xyz-postgres
+    environment:
+      POSTGRES_DB: banco_xyz
+      POSTGRES_USER: banco_user
+      POSTGRES_PASSWORD: banco_password_local
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U banco_user -d banco_xyz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:3.9.1
+    container_name: banco-xyz-kafka
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+  config-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: config-server
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./config-repo:/app/config-repo:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8888/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  eureka-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: eureka-server
+    ports:
+      - "8761:8761"
+    depends_on:
+      config-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8761/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  authorization-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: authorization-server
+    environment:
+      OAUTH2_ISSUER: http://authorization-server:9000
+      OAUTH2_WEB_SECRET: ${OAUTH2_WEB_SECRET:-web-secret-local}
+      OAUTH2_MOBILE_SECRET: ${OAUTH2_MOBILE_SECRET:-mobile-secret-local}
+      OAUTH2_ATM_SECRET: ${OAUTH2_ATM_SECRET:-atm-secret-local}
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  batch-init:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: core-banking-service
+    entrypoint: ["/usr/local/bin/batch-init.sh"]
+    environment:
+      OAUTH2_ISSUER: http://authorization-server:9000
+      OAUTH2_JWK_SET_URI: http://authorization-server:9000/oauth2/jwks
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_URL: http://eureka-server:8761/eureka/
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/banco_xyz
+      SPRING_DATASOURCE_USERNAME: banco_user
+      SPRING_DATASOURCE_PASSWORD: banco_password_local
+    depends_on:
+      authorization-server:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+      eureka-server:
+        condition: service_healthy
+
+  core-banking-service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: core-banking-service
+    environment:
+      OAUTH2_ISSUER: http://authorization-server:9000
+      OAUTH2_JWK_SET_URI: http://authorization-server:9000/oauth2/jwks
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_URL: http://eureka-server:8761/eureka/
+      EUREKA_INSTANCE_HOSTNAME: core-banking-service
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/banco_xyz
+      SPRING_DATASOURCE_USERNAME: banco_user
+      SPRING_DATASOURCE_PASSWORD: banco_password_local
+      SPRING_BATCH_JOB_ENABLED: "false"
+    ports:
+      - "8081:8081"
+    depends_on:
+      authorization-server:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      batch-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  bff-web-service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: bff-web-service
+    environment:
+      OAUTH2_ISSUER: http://authorization-server:9000
+      OAUTH2_JWK_SET_URI: http://authorization-server:9000/oauth2/jwks
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_URL: http://eureka-server:8761/eureka/
+      EUREKA_INSTANCE_HOSTNAME: bff-web-service
+    ports:
+      - "8082:8082"
+    depends_on:
+      authorization-server:
+        condition: service_healthy
+      core-banking-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8082/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  bff-mobile-service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: bff-mobile-service
+    environment:
+      OAUTH2_ISSUER: http://authorization-server:9000
+      OAUTH2_JWK_SET_URI: http://authorization-server:9000/oauth2/jwks
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_URL: http://eureka-server:8761/eureka/
+      EUREKA_INSTANCE_HOSTNAME: bff-mobile-service
+    ports:
+      - "8083:8083"
+    depends_on:
+      authorization-server:
+        condition: service_healthy
+      core-banking-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  bff-atm-service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        MODULE: bff-atm-service
+    environment:
+      OAUTH2_ISSUER: http://authorization-server:9000
+      OAUTH2_JWK_SET_URI: http://authorization-server:9000/oauth2/jwks
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_URL: http://eureka-server:8761/eureka/
+      EUREKA_INSTANCE_HOSTNAME: bff-atm-service
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    ports:
+      - "8084:8084"
+    depends_on:
+      authorization-server:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      core-banking-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8084/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  postgres_data:
